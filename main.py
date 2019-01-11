@@ -4,74 +4,62 @@ from scipy.spatial import *
 import glob
 import sys
 from readparticles import *
-import mpi4py
+from measurement   import *
+from parameters    import *
 
-path='./output_00010/'
-ntile=8
-nproc = ntile**3
-buffersize=0.1
+import mpi4py.rc
+if serial: mpi4py.rc.initialize = False
+from mpi4py import MPI
 
-def rank2tiles(rank,ntile):
-    ix = rank / ntile**2
-    iy = (rank - ix * ntile**2) / ntile
-    iz = (rank - ix * ntile**2) - iy * ntile
-    return ix,iy,iz
+if MPI.Is_initialized():
+    comm     = MPI.COMM_WORLD
+    rank     = comm.Get_rank()
+    nproc    = comm.Get_size()
+    parallel = True
+else:
+    nproc = ntile**3
+    comm     = 0
+    parallel = False
 
-def tiles2bbox(ix,iy,iz,ntile,buffersize):
+if serial:
+    rank=0
+    tile=0
+    getrlagsingle(rank,comm,tile,ntile,buffersize)
+    sys.exit(0)
 
-    l1b = buffersize
-    l2b = 1-buffersize
-    dtile = (l2b-l1b) / ntile
+numtiles = ntile**3
+Rlag=np.zeros(0)
+if rank == 0: print nproc,ntile
+for tile in np.arange(numtiles):
+    if tile % nproc ==  rank:
+        Rlagc=getrlagsingle(rank,comm,tile,ntile,buffersize)
+        Rlag = np.concatenate((Rlagc,Rlag))
 
-    x1 = l1b + ix*dtile - buffersize
-    x2 = x1  + dtile    + 2 * buffersize
+comm.barrier()
 
-    y1 = l1b + iy*dtile - buffersize
-    y2 = y1  + dtile    + 2 * buffersize
+Rlag = Rlag.astype(np.float32)
 
-    z1 = l1b + iz*dtile - buffersize
-    z2 = z1 + dtile     + 2 * buffersize
+npart  = np.asarray([len(Rlag)],dtype=np.int32)
 
-    return x1,x2,y1,y2,z1,z2
+npartt = np.asarray([0],dtype=np.int32)
+comm.Allreduce(npart,npartt)
 
-def splitparticles(rank,ntile,buffersize):
+nparteach=np.zeros(nproc,np.int32)
+comm.Allgather(npart,nparteach)
 
-    ix,iy,iz = rank2tiles(rank,ntile)
-    x1, x2, y1, y2, z1, z2 = tiles2bbox(ix,iy,iz,ntile,buffersize)
+offsets=np.roll(np.cumsum(nparteach),1); offsets[0]=0
+nparteach=tuple(nparteach); offsets=tuple(offsets)
 
-    print 'tiling for rank ',rank,':'
-    print '    ',x1,x2,y1,y2,z1,z2
+Rlagt=None
+if rank==0: Rlagt=np.empty(npartt[0],dtype=np.float32)
 
-    npart=0
-    i=0
-    x=np.zeros(0)
-    y=np.zeros(0)
-    z=np.zeros(0)
-    for fname in fnames:
-        i+=1
-        xc,yc,zc,npart2 = getparticles(fname)
-        
-        dm = [(xc>x1) & (xc<x2) &
-              (yc>y1) & (yc<y2) &
-              (zc>z1) & (zc<z2) ]
-        x = np.concatenate((x,xc[dm]))
-        y = np.concatenate((y,yc[dm]))
-        z = np.concatenate((z,zc[dm]))
-        npartc = len(xc[dm])
-        nparttot = len(x)
-        print 'npartc, nparttot = ',npartc,nparttot,'for ',i,' of ',len(fnames)
+sendbuf=[Rlag, nparteach[rank],MPI.FLOAT]
+recvbuf=[Rlagt,nparteach,offsets,MPI.FLOAT]
+comm.Gatherv(sendbuf,recvbuf,root=0)
 
-    return x,y,z
-
-# faux parallelization by looping over ranks in serial
-
-fnames=glob.glob(path+'part*')
-for rank in np.arange(1):
-    x,y,z = splitparticles(rank,ntile,buffersize)
-    print 'total npart ',len(x)
-    print 'bounds: ',x.min(),x.max(),y.min(),y.max(),z.min(),z.max()
-
-
+if rank==0:
+    print 'local and total sizes of Rlag on root:',len(Rlag),len(Rlagt)
+    np.savez(pdffname,Rlagt=Rlag)
 
 
 
